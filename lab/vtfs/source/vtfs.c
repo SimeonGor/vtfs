@@ -27,7 +27,6 @@ static struct dentry* vtfs_mount(struct file_system_type* fs_type,
                                   const char* token,
                                   void* data);
 static void vtfs_kill_sb(struct super_block* sb);
-
 static struct dentry* vtfs_lookup(struct inode* parent_inode,
                                    struct dentry* child_dentry,
                                    unsigned int flag);
@@ -66,7 +65,28 @@ static struct inode* vtfs_get_inode(struct super_block* sb,
 static struct dentry* vtfs_lookup(struct inode* parent_inode,
                                    struct dentry* child_dentry,
                                    unsigned int flag) {
-  // Пока просто возвращаем NULL - файлов еще нет
+  ino_t root = parent_inode->i_ino;
+  const char *name = child_dentry->d_name.name;
+  
+  // Для корневой директории
+  if (root == VTFS_ROOT_INODE_NUMBER) {
+    if (strcmp(name, "test.txt") == 0) {
+      // Создаём inode для файла test.txt
+      struct inode *inode = vtfs_get_inode(parent_inode->i_sb, NULL,
+                                           S_IFREG | S_IRWXUGO, 101);
+      inode->i_op = &vtfs_inode_ops;
+      inode->i_fop = NULL;
+      d_add(child_dentry, inode);
+    } else if (strcmp(name, "dir") == 0) {
+      // Создаём inode для директории dir
+      struct inode *inode = vtfs_get_inode(parent_inode->i_sb, NULL,
+                                           S_IFDIR | S_IRWXUGO, 200);
+      inode->i_op = &vtfs_inode_ops;
+      inode->i_fop = &vtfs_dir_ops;
+      d_add(child_dentry, inode);
+    }
+  }
+  
   return NULL;
 }
 
@@ -94,6 +114,27 @@ static int vtfs_iterate(struct file* filp, struct dir_context* ctx) {
       strcpy(fsname, "test.txt");
       ftype = DT_REG;
       dino = 101;
+    } else if (offset == 3) {
+      strcpy(fsname, "dir");
+      ftype = DT_DIR;
+      dino = 200;
+    } else {
+      return 0;
+    }
+
+    dir_emit(ctx, fsname, strlen(fsname), dino, ftype);
+    ctx->pos++;
+    return 0;
+  } else if (ino == 200) {
+    // Для директории dir
+    if (offset == 0) {
+      strcpy(fsname, ".");
+      ftype = DT_DIR;
+      dino = ino;
+    } else if (offset == 1) {
+      strcpy(fsname, "..");
+      ftype = DT_DIR;
+      dino = dentry->d_parent->d_inode->i_ino;
     } else {
       return 0;
     }
