@@ -27,6 +27,7 @@ struct vtfs_file_data {
   char *data;             // Содержимое файла
   size_t size;            // Размер данных
   size_t capacity;        // Выделенная память
+  unsigned int link_count; // Счётчик жёстких ссылок
 };
 
 // Структура для представления записи в директории
@@ -82,10 +83,15 @@ static int vtfs_mkdir(struct mnt_idmap *idmap,
                        umode_t mode);
 static int vtfs_rmdir(struct inode *parent_inode,
                        struct dentry *child_dentry);
+
 static ssize_t vtfs_read(struct file *filp, char __user *buffer,
                           size_t len, loff_t *offset);
 static ssize_t vtfs_write(struct file *filp, const char __user *buffer,
                            size_t len, loff_t *offset);
+
+static int vtfs_link(struct dentry *old_dentry,
+                      struct inode *parent_dir,
+                      struct dentry *new_dentry);
 
 // Структуры операций для inode и файлов
 static struct inode_operations vtfs_inode_ops = {
@@ -94,6 +100,7 @@ static struct inode_operations vtfs_inode_ops = {
   .unlink = vtfs_unlink,
   .mkdir = vtfs_mkdir,
   .rmdir = vtfs_rmdir,
+  .link = vtfs_link,
 };
 
 static struct file_operations vtfs_dir_ops = {
@@ -139,6 +146,7 @@ static struct vtfs_file_data* vtfs_create_file_data(ino_t ino) {
   file_data->data = NULL;
   file_data->size = 0;
   file_data->capacity = 0;
+  file_data->link_count = 1;  // Первая ссылка
   
   list_add_tail(&file_data->list, &all_files);
   return file_data;
@@ -424,6 +432,7 @@ static int vtfs_unlink(struct inode *parent_inode,
   const char *name = child_dentry->d_name.name;
   struct vtfs_dir *dir;
   struct vtfs_dir_entry *entry;
+  struct vtfs_file_data *file_data;
   int ret;
   
   mutex_lock(&vtfs_mutex);
@@ -440,8 +449,15 @@ static int vtfs_unlink(struct inode *parent_inode,
     return -ENOENT;
   }
   
-  // Удалить данные файла
-  vtfs_remove_file_data(entry->ino);
+  // Уменьшить счётчик ссылок
+  file_data = vtfs_find_file_data(entry->ino);
+  if (file_data) {
+    file_data->link_count--;
+    // Удалить данные файла только если это была последняя ссылка
+    if (file_data->link_count == 0) {
+      vtfs_remove_file_data(entry->ino);
+    }
+  }
   
   ret = vtfs_remove_entry(dir, name);
   
@@ -546,6 +562,65 @@ static int vtfs_rmdir(struct inode *parent_inode,
   
   // Удалить саму директорию
   vtfs_remove_dir(entry->ino);
+  
+  mutex_unlock(&vtfs_mutex);
+  return 0;
+}
+
+// Функция link - создание жёсткой ссылки
+static int vtfs_link(struct dentry *old_dentry,
+                      struct inode *parent_dir,
+                      struct dentry *new_dentry) {
+  struct inode *old_inode = d_inode(old_dentry);
+  ino_t parent_ino = parent_dir->i_ino;
+  const char *new_name = new_dentry->d_name.name;
+  struct vtfs_dir *dir;
+  struct vtfs_file_data *file_data;
+  struct inode *new_inode;
+  int ret;
+  
+  // Жёсткие ссылки только для регулярных файлов
+  if (!S_ISREG(old_inode->i_mode)) {
+    return -EPERM;
+  }
+  
+  mutex_lock(&vtfs_mutex);
+  
+  dir = vtfs_find_dir(parent_ino);
+  if (!dir) {
+    mutex_unlock(&vtfs_mutex);
+    return -ENOENT;
+  }
+  
+  // Увеличить счётчик ссылок
+  file_data = vtfs_find_file_data(old_inode->i_ino);
+  if (!file_data) {
+    mutex_unlock(&vtfs_mutex);
+    return -ENOENT;
+  }
+  
+  file_data->link_count++;
+  
+  // Добавить новую запись в директорию с тем же inode
+  ret = vtfs_add_entry(dir, new_name, old_inode->i_ino, S_IFREG | S_IRWXUGO);
+  if (ret) {
+    file_data->link_count--;  // Откатить изменение
+    mutex_unlock(&vtfs_mutex);
+    return ret;
+  }
+  
+  // Создать новую inode для новой ссылки
+  new_inode = vtfs_get_inode(parent_dir->i_sb, NULL, S_IFREG | S_IRWXUGO, old_inode->i_ino);
+  if (!new_inode) {
+    vtfs_remove_entry(dir, new_name);
+    file_data->link_count--;
+    mutex_unlock(&vtfs_mutex);
+    return -ENOMEM;
+  }
+  
+  new_inode->i_op = &vtfs_inode_ops;
+  new_inode->i_fop = &vtfs_file_ops;
+  d_add(new_dentry, new_inode);
   
   mutex_unlock(&vtfs_mutex);
   return 0;
