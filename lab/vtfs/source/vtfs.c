@@ -6,50 +6,22 @@
 #include <linux/stat.h>
 #include <linux/string.h>
 #include <linux/slab.h>
-#include <linux/list.h>
 #include <linux/uaccess.h>
+#include "http.h"
 
 #define MODULE_NAME "vtfs"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("secs-dev");
-MODULE_DESCRIPTION("A simple FS kernel module");
+MODULE_DESCRIPTION("A simple remote FS kernel module");
 
 #define LOG(fmt, ...) pr_info("[" MODULE_NAME "]: " fmt, ##__VA_ARGS__)
 
-#define VTFS_ROOT_INODE_NUMBER 1000
 #define VTFS_MAX_FILENAME 255
+#define VTFS_MAX_TOKEN_LEN 256
 
-// Структура для хранения содержимого файла
-struct vtfs_file_data {
-  struct list_head list;  // Для глобального списка файлов
-  ino_t ino;
-  char *data;             // Содержимое файла
-  size_t size;            // Размер данных
-  size_t capacity;        // Выделенная память
-  unsigned int link_count; // Счётчик жёстких ссылок
-};
-
-// Структура для представления записи в директории
-struct vtfs_dir_entry {
-  struct list_head list;  // Для связного списка элементов директории
-  char name[VTFS_MAX_FILENAME];
-  ino_t ino;
-  umode_t mode;           // Тип (файл/директория) и права
-};
-
-// Структура для представления директории
-struct vtfs_dir {
-  struct list_head list;     // Для глобального списка директорий
-  ino_t ino;
-  ino_t parent_ino;
-  struct list_head entries;  // Список записей в директории
-};
-
-// Глобальные переменные для хранилища
-static LIST_HEAD(all_directories);  // Глобальный список всех директорий
-static LIST_HEAD(all_files);        // Глобальный список всех файлов
-static ino_t next_ino = VTFS_ROOT_INODE_NUMBER + 1;
+// Глобальный токен для доступа к серверу
+static char vtfs_token[VTFS_MAX_TOKEN_LEN] = "";
 static DEFINE_MUTEX(vtfs_mutex);
 
 // Прототипы функций
@@ -119,164 +91,6 @@ static struct file_system_type vtfs_fs_type = {
   .kill_sb = vtfs_kill_sb,
 };
 
-// ========== Функции для работы с содержимым файлов ==========
-
-// Найти данные файла по inode
-static struct vtfs_file_data* vtfs_find_file_data(ino_t ino) {
-  struct vtfs_file_data *file_data;
-  
-  list_for_each_entry(file_data, &all_files, list) {
-    if (file_data->ino == ino) {
-      return file_data;
-    }
-  }
-  return NULL;
-}
-
-// Создать пустой файл
-static struct vtfs_file_data* vtfs_create_file_data(ino_t ino) {
-  struct vtfs_file_data *file_data;
-  
-  file_data = kmalloc(sizeof(*file_data), GFP_KERNEL);
-  if (!file_data) {
-    return NULL;
-  }
-  
-  file_data->ino = ino;
-  file_data->data = NULL;
-  file_data->size = 0;
-  file_data->capacity = 0;
-  file_data->link_count = 1;  // Первая ссылка
-  
-  list_add_tail(&file_data->list, &all_files);
-  return file_data;
-}
-
-// Удалить данные файла
-static void vtfs_remove_file_data(ino_t ino) {
-  struct vtfs_file_data *file_data;
-  
-  file_data = vtfs_find_file_data(ino);
-  if (!file_data) {
-    return;
-  }
-  
-  if (file_data->data) {
-    kfree(file_data->data);
-  }
-  
-  list_del(&file_data->list);
-  kfree(file_data);
-}
-
-// ========== Функции для работы с RAM-хранилищем директорий ==========
-
-// Найти директорию по inode
-static struct vtfs_dir* vtfs_find_dir(ino_t ino) {
-  struct vtfs_dir *dir;
-  
-  list_for_each_entry(dir, &all_directories, list) {
-    if (dir->ino == ino) {
-      return dir;
-    }
-  }
-  return NULL;
-}
-
-// Создать новую директорию
-static struct vtfs_dir* vtfs_create_dir(ino_t ino, ino_t parent_ino) {
-  struct vtfs_dir *dir;
-  
-  dir = kmalloc(sizeof(*dir), GFP_KERNEL);
-  if (!dir) {
-    return NULL;
-  }
-  
-  dir->ino = ino;
-  dir->parent_ino = parent_ino;
-  INIT_LIST_HEAD(&dir->entries);
-  
-  // Добавить в глобальный список директорий
-  list_add_tail(&dir->list, &all_directories);
-  
-  return dir;
-}
-
-// Удалить директорию
-static void vtfs_remove_dir(ino_t ino) {
-  struct vtfs_dir *dir;
-  struct vtfs_dir_entry *entry, *tmp;
-  
-  dir = vtfs_find_dir(ino);
-  if (!dir) {
-    return;
-  }
-  
-  // Удалить все записи в директории
-  list_for_each_entry_safe(entry, tmp, &dir->entries, list) {
-    list_del(&entry->list);
-    kfree(entry);
-  }
-  
-  // Удалить директорию из глобального списка
-  list_del(&dir->list);
-  kfree(dir);
-}
-
-// Найти запись в директории по имени
-static struct vtfs_dir_entry* vtfs_find_entry(struct vtfs_dir *dir, const char *name) {
-  struct vtfs_dir_entry *entry;
-  
-  list_for_each_entry(entry, &dir->entries, list) {
-    if (strcmp(entry->name, name) == 0) {
-      return entry;
-    }
-  }
-  return NULL;
-}
-
-// Добавить запись в директорию
-static int vtfs_add_entry(struct vtfs_dir *dir, const char *name, ino_t ino, umode_t mode) {
-  struct vtfs_dir_entry *entry;
-  
-  // Проверить, что имя не существует
-  if (vtfs_find_entry(dir, name)) {
-    return -EEXIST;
-  }
-  
-  entry = kmalloc(sizeof(*entry), GFP_KERNEL);
-  if (!entry) {
-    return -ENOMEM;
-  }
-  
-  strncpy(entry->name, name, VTFS_MAX_FILENAME - 1);
-  entry->name[VTFS_MAX_FILENAME - 1] = '\0';
-  entry->ino = ino;
-  entry->mode = mode;
-  
-  list_add_tail(&entry->list, &dir->entries);
-  return 0;
-}
-
-// Удалить запись из директории
-static int vtfs_remove_entry(struct vtfs_dir *dir, const char *name) {
-  struct vtfs_dir_entry *entry;
-  
-  entry = vtfs_find_entry(dir, name);
-  if (!entry) {
-    return -ENOENT;
-  }
-  
-  list_del(&entry->list);
-  kfree(entry);
-  return 0;
-}
-
-// Проверить, пуста ли директория (кроме . и ..)
-static bool vtfs_is_dir_empty(struct vtfs_dir *dir) {
-  return list_empty(&dir->entries);
-}
-
 // ========== Функции файловой системы ==========
 
 // Создание нового inode
@@ -298,29 +112,33 @@ static struct dentry* vtfs_lookup(struct inode* parent_inode,
                                    unsigned int flag) {
   ino_t parent_ino = parent_inode->i_ino;
   const char *name = child_dentry->d_name.name;
-  struct vtfs_dir *dir;
-  struct vtfs_dir_entry *entry;
   struct inode *inode;
+  ino_t result_ino;
+  int ret;
+  int is_dir;
   
   mutex_lock(&vtfs_mutex);
   
-  dir = vtfs_find_dir(parent_ino);
-  if (!dir) {
-    mutex_unlock(&vtfs_mutex);
-    return NULL;
-  }
+  // Вызвать API lookup для поиска файла/директории
+  ret = vtfs_api_lookup(vtfs_token, parent_ino, name, &result_ino);
   
-  entry = vtfs_find_entry(dir, name);
-  if (entry) {
-    inode = vtfs_get_inode(parent_inode->i_sb, NULL, entry->mode, entry->ino);
-    if (inode) {
-      inode->i_op = &vtfs_inode_ops;
-      if (S_ISDIR(entry->mode)) {
-        inode->i_fop = &vtfs_dir_ops;
-      } else {
-        inode->i_fop = &vtfs_file_ops;
+  if (ret == 0) {
+    // Определить тип - файл или директория
+    ret = vtfs_api_is_dir(vtfs_token, result_ino, &is_dir);
+    
+    if (ret == 0) {
+      umode_t mode = is_dir ? (S_IFDIR | S_IRWXUGO) : (S_IFREG | S_IRWXUGO);
+      
+      inode = vtfs_get_inode(parent_inode->i_sb, NULL, mode, result_ino);
+      if (inode) {
+        inode->i_op = &vtfs_inode_ops;
+        if (is_dir) {
+          inode->i_fop = &vtfs_dir_ops;
+        } else {
+          inode->i_fop = &vtfs_file_ops;
+        }
+        d_add(child_dentry, inode);
       }
-      d_add(child_dentry, inode);
     }
   }
   
@@ -333,17 +151,18 @@ static int vtfs_iterate(struct file* filp, struct dir_context* ctx) {
   struct dentry* dentry = filp->f_path.dentry;
   struct inode* inode = dentry->d_inode;
   ino_t ino = inode->i_ino;
-  struct vtfs_dir *dir;
-  struct vtfs_dir_entry *entry;
-  int i = 0;
+  struct vtfs_list_entry *entries;
+  int count = 0;
+  int ret;
+  int i;
+  
+  // Выделить память для списка файлов
+  entries = kmalloc(256 * sizeof(struct vtfs_list_entry), GFP_KERNEL);
+  if (!entries) {
+    return -ENOMEM;
+  }
   
   mutex_lock(&vtfs_mutex);
-  
-  dir = vtfs_find_dir(ino);
-  if (!dir) {
-    mutex_unlock(&vtfs_mutex);
-    return 0;
-  }
   
   // Всегда показываем . и ..
   if (ctx->pos == 0) {
@@ -352,22 +171,35 @@ static int vtfs_iterate(struct file* filp, struct dir_context* ctx) {
   }
   
   if (ctx->pos == 1) {
-    dir_emit(ctx, "..", 2, dir->parent_ino, DT_DIR);
+    ino_t parent_ino = ino; // Для корня parent = сам корень
+    if (dentry->d_parent && dentry->d_parent->d_inode) {
+      parent_ino = dentry->d_parent->d_inode->i_ino;
+    }
+    dir_emit(ctx, "..", 2, parent_ino, DT_DIR);
     ctx->pos++;
   }
   
-  // Пропускаем уже обработанные записи
-  i = 2;
-  list_for_each_entry(entry, &dir->entries, list) {
-    if (i >= ctx->pos) {
-      unsigned char dtype = S_ISDIR(entry->mode) ? DT_DIR : DT_REG;
-      dir_emit(ctx, entry->name, strlen(entry->name), entry->ino, dtype);
+  // Получить список файлов с сервера
+  ret = vtfs_api_list(vtfs_token, ino, entries, 256, &count);
+  
+  if (ret == 0) {
+    // Показать файлы начиная с текущей позиции
+    for (i = ctx->pos - 2; i < count; i++) {
+      unsigned char dtype = DT_UNKNOWN;
+      int is_dir_flag = 0;
+      
+      // Определить тип
+      if (vtfs_api_is_dir(vtfs_token, entries[i].ino, &is_dir_flag) == 0) {
+        dtype = is_dir_flag ? DT_DIR : DT_REG;
+      }
+      
+      dir_emit(ctx, entries[i].name, strlen(entries[i].name), entries[i].ino, dtype);
       ctx->pos++;
     }
-    i++;
   }
   
   mutex_unlock(&vtfs_mutex);
+  kfree(entries);
   return 0;
 }
 
@@ -379,40 +211,24 @@ static int vtfs_create(struct mnt_idmap *idmap,
                         bool excl) {
   ino_t parent_ino = parent_inode->i_ino;
   const char *name = child_dentry->d_name.name;
-  struct vtfs_dir *dir;
   struct inode *inode;
-  struct vtfs_file_data *file_data;
   ino_t new_ino;
   int ret;
   
   mutex_lock(&vtfs_mutex);
   
-  dir = vtfs_find_dir(parent_ino);
-  if (!dir) {
-    mutex_unlock(&vtfs_mutex);
-    return -ENOENT;
-  }
+  // Вызвать API create для создания файла
+  ret = vtfs_api_create(vtfs_token, parent_ino, name, &new_ino);
   
-  new_ino = next_ino++;
-  
-  // Создать данные файла
-  file_data = vtfs_create_file_data(new_ino);
-  if (!file_data) {
-    mutex_unlock(&vtfs_mutex);
-    return -ENOMEM;
-  }
-  
-  ret = vtfs_add_entry(dir, name, new_ino, S_IFREG | S_IRWXUGO);
-  if (ret) {
-    vtfs_remove_file_data(new_ino);
+  if (ret != 0) {
     mutex_unlock(&vtfs_mutex);
     return ret;
   }
   
   inode = vtfs_get_inode(parent_inode->i_sb, NULL, S_IFREG | S_IRWXUGO, new_ino);
   if (!inode) {
-    vtfs_remove_entry(dir, name);
-    vtfs_remove_file_data(new_ino);
+    // Попытаться удалить созданный файл
+    vtfs_api_unlink(vtfs_token, parent_ino, name);
     mutex_unlock(&vtfs_mutex);
     return -ENOMEM;
   }
@@ -430,36 +246,12 @@ static int vtfs_unlink(struct inode *parent_inode,
                         struct dentry *child_dentry) {
   ino_t parent_ino = parent_inode->i_ino;
   const char *name = child_dentry->d_name.name;
-  struct vtfs_dir *dir;
-  struct vtfs_dir_entry *entry;
-  struct vtfs_file_data *file_data;
   int ret;
   
   mutex_lock(&vtfs_mutex);
   
-  dir = vtfs_find_dir(parent_ino);
-  if (!dir) {
-    mutex_unlock(&vtfs_mutex);
-    return -ENOENT;
-  }
-  
-  entry = vtfs_find_entry(dir, name);
-  if (!entry) {
-    mutex_unlock(&vtfs_mutex);
-    return -ENOENT;
-  }
-  
-  // Уменьшить счётчик ссылок
-  file_data = vtfs_find_file_data(entry->ino);
-  if (file_data) {
-    file_data->link_count--;
-    // Удалить данные файла только если это была последняя ссылка
-    if (file_data->link_count == 0) {
-      vtfs_remove_file_data(entry->ino);
-    }
-  }
-  
-  ret = vtfs_remove_entry(dir, name);
+  // Вызвать API unlink для удаления файла
+  ret = vtfs_api_unlink(vtfs_token, parent_ino, name);
   
   mutex_unlock(&vtfs_mutex);
   return ret;
@@ -472,40 +264,24 @@ static int vtfs_mkdir(struct mnt_idmap *idmap,
                        umode_t mode) {
   ino_t parent_ino = parent_inode->i_ino;
   const char *name = child_dentry->d_name.name;
-  struct vtfs_dir *parent_dir, *new_dir;
   struct inode *inode;
   ino_t new_ino;
   int ret;
   
   mutex_lock(&vtfs_mutex);
   
-  parent_dir = vtfs_find_dir(parent_ino);
-  if (!parent_dir) {
-    mutex_unlock(&vtfs_mutex);
-    return -ENOENT;
-  }
+  // Вызвать API mkdir для создания директории
+  ret = vtfs_api_mkdir(vtfs_token, parent_ino, name, &new_ino);
   
-  new_ino = next_ino++;
-  
-  // Создать новую директорию
-  new_dir = vtfs_create_dir(new_ino, parent_ino);
-  if (!new_dir) {
-    mutex_unlock(&vtfs_mutex);
-    return -ENOMEM;
-  }
-  
-  // Добавить запись в родительскую директорию
-  ret = vtfs_add_entry(parent_dir, name, new_ino, S_IFDIR | S_IRWXUGO);
-  if (ret) {
-    vtfs_remove_dir(new_ino);
+  if (ret != 0) {
     mutex_unlock(&vtfs_mutex);
     return ret;
   }
   
   inode = vtfs_get_inode(parent_inode->i_sb, NULL, S_IFDIR | S_IRWXUGO, new_ino);
   if (!inode) {
-    vtfs_remove_entry(parent_dir, name);
-    vtfs_remove_dir(new_ino);
+    // Попытаться удалить созданную директорию
+    vtfs_api_rmdir(vtfs_token, parent_ino, name);
     mutex_unlock(&vtfs_mutex);
     return -ENOMEM;
   }
@@ -523,48 +299,15 @@ static int vtfs_rmdir(struct inode *parent_inode,
                        struct dentry *child_dentry) {
   ino_t parent_ino = parent_inode->i_ino;
   const char *name = child_dentry->d_name.name;
-  struct vtfs_dir *parent_dir, *target_dir;
-  struct vtfs_dir_entry *entry;
   int ret;
   
   mutex_lock(&vtfs_mutex);
   
-  parent_dir = vtfs_find_dir(parent_ino);
-  if (!parent_dir) {
-    mutex_unlock(&vtfs_mutex);
-    return -ENOENT;
-  }
-  
-  entry = vtfs_find_entry(parent_dir, name);
-  if (!entry) {
-    mutex_unlock(&vtfs_mutex);
-    return -ENOENT;
-  }
-  
-  target_dir = vtfs_find_dir(entry->ino);
-  if (!target_dir) {
-    mutex_unlock(&vtfs_mutex);
-    return -ENOTDIR;
-  }
-  
-  // Проверить, что директория пуста
-  if (!vtfs_is_dir_empty(target_dir)) {
-    mutex_unlock(&vtfs_mutex);
-    return -ENOTEMPTY;
-  }
-  
-  // Удалить запись из родительской директории
-  ret = vtfs_remove_entry(parent_dir, name);
-  if (ret) {
-    mutex_unlock(&vtfs_mutex);
-    return ret;
-  }
-  
-  // Удалить саму директорию
-  vtfs_remove_dir(entry->ino);
+  // Вызвать API rmdir для удаления директории
+  ret = vtfs_api_rmdir(vtfs_token, parent_ino, name);
   
   mutex_unlock(&vtfs_mutex);
-  return 0;
+  return ret;
 }
 
 // Функция link - создание жёсткой ссылки
@@ -574,8 +317,6 @@ static int vtfs_link(struct dentry *old_dentry,
   struct inode *old_inode = d_inode(old_dentry);
   ino_t parent_ino = parent_dir->i_ino;
   const char *new_name = new_dentry->d_name.name;
-  struct vtfs_dir *dir;
-  struct vtfs_file_data *file_data;
   struct inode *new_inode;
   int ret;
   
@@ -586,34 +327,19 @@ static int vtfs_link(struct dentry *old_dentry,
   
   mutex_lock(&vtfs_mutex);
   
-  dir = vtfs_find_dir(parent_ino);
-  if (!dir) {
-    mutex_unlock(&vtfs_mutex);
-    return -ENOENT;
-  }
+  // Вызвать API link для создания жёсткой ссылки
+  ret = vtfs_api_link(vtfs_token, old_inode->i_ino, parent_ino, new_name);
   
-  // Увеличить счётчик ссылок
-  file_data = vtfs_find_file_data(old_inode->i_ino);
-  if (!file_data) {
-    mutex_unlock(&vtfs_mutex);
-    return -ENOENT;
-  }
-  
-  file_data->link_count++;
-  
-  // Добавить новую запись в директорию с тем же inode
-  ret = vtfs_add_entry(dir, new_name, old_inode->i_ino, S_IFREG | S_IRWXUGO);
-  if (ret) {
-    file_data->link_count--;  // Откатить изменение
+  if (ret != 0) {
     mutex_unlock(&vtfs_mutex);
     return ret;
   }
   
-  // Создать новую inode для новой ссылки
+  // Создать новую inode для новой ссылки (с тем же номером inode)
   new_inode = vtfs_get_inode(parent_dir->i_sb, NULL, S_IFREG | S_IRWXUGO, old_inode->i_ino);
   if (!new_inode) {
-    vtfs_remove_entry(dir, new_name);
-    file_data->link_count--;
+    // Попытаться удалить созданную ссылку
+    vtfs_api_unlink(vtfs_token, parent_ino, new_name);
     mutex_unlock(&vtfs_mutex);
     return -ENOMEM;
   }
@@ -630,116 +356,102 @@ static int vtfs_link(struct dentry *old_dentry,
 static ssize_t vtfs_read(struct file *filp, char __user *buffer,
                           size_t len, loff_t *offset) {
   struct inode *inode = file_inode(filp);
-  struct vtfs_file_data *file_data;
-  size_t to_read;
+  char *kernel_buffer;
+  size_t actual_len = 0;
+  int ret;
+  
+  // Выделить буфер в kernel space
+  kernel_buffer = kmalloc(len, GFP_KERNEL);
+  if (!kernel_buffer) {
+    return -ENOMEM;
+  }
   
   mutex_lock(&vtfs_mutex);
   
-  file_data = vtfs_find_file_data(inode->i_ino);
-  if (!file_data) {
-    mutex_unlock(&vtfs_mutex);
-    return -ENOENT;
-  }
+  // Вызвать API read для чтения данных
+  ret = vtfs_api_read(vtfs_token, inode->i_ino, *offset, len, kernel_buffer, &actual_len);
   
-  // Проверить границы чтения
-  if (*offset >= file_data->size) {
+  if (ret != 0) {
     mutex_unlock(&vtfs_mutex);
-    return 0;  // EOF
+    kfree(kernel_buffer);
+    return ret;
   }
-  
-  // Вычислить сколько байт читать
-  to_read = min(len, file_data->size - (size_t)*offset);
   
   // Скопировать данные в user-space
-  if (copy_to_user(buffer, file_data->data + *offset, to_read)) {
-    mutex_unlock(&vtfs_mutex);
-    return -EFAULT;
+  if (actual_len > 0) {
+    if (copy_to_user(buffer, kernel_buffer, actual_len)) {
+      mutex_unlock(&vtfs_mutex);
+      kfree(kernel_buffer);
+      return -EFAULT;
+    }
   }
   
-  *offset += to_read;
+  *offset += actual_len;
   mutex_unlock(&vtfs_mutex);
+  kfree(kernel_buffer);
   
-  return to_read;
+  return actual_len;
 }
 
 // Функция write - запись в файл
 static ssize_t vtfs_write(struct file *filp, const char __user *buffer,
                            size_t len, loff_t *offset) {
   struct inode *inode = file_inode(filp);
-  struct vtfs_file_data *file_data;
-  size_t new_size;
-  char *new_data;
+  char *kernel_buffer;
+  int ret;
   
-  mutex_lock(&vtfs_mutex);
-  
-  file_data = vtfs_find_file_data(inode->i_ino);
-  if (!file_data) {
-    mutex_unlock(&vtfs_mutex);
-    return -ENOENT;
-  }
-  
-  // Вычислить новый размер файла
-  new_size = *offset + len;
-  
-  // Если нужно больше памяти, перевыделить
-  if (new_size > file_data->capacity) {
-    size_t new_capacity = max(new_size, file_data->capacity * 2);
-    if (new_capacity == 0) {
-      new_capacity = PAGE_SIZE;
-    }
-    
-    new_data = krealloc(file_data->data, new_capacity, GFP_KERNEL);
-    if (!new_data) {
-      mutex_unlock(&vtfs_mutex);
-      return -ENOMEM;
-    }
-    
-    file_data->data = new_data;
-    file_data->capacity = new_capacity;
-  }
-  
-  // Если записываем за пределами текущего размера, заполнить нулями
-  if (*offset > file_data->size) {
-    memset(file_data->data + file_data->size, 0, *offset - file_data->size);
+  // Выделить буфер в kernel space
+  kernel_buffer = kmalloc(len, GFP_KERNEL);
+  if (!kernel_buffer) {
+    return -ENOMEM;
   }
   
   // Скопировать данные из user-space
-  if (copy_from_user(file_data->data + *offset, buffer, len)) {
-    mutex_unlock(&vtfs_mutex);
+  if (copy_from_user(kernel_buffer, buffer, len)) {
+    kfree(kernel_buffer);
     return -EFAULT;
   }
   
-  // Обновить размер файла
-  if (new_size > file_data->size) {
-    file_data->size = new_size;
-    inode->i_size = new_size;
+  mutex_lock(&vtfs_mutex);
+  
+  // Вызвать API write для записи данных
+  ret = vtfs_api_write(vtfs_token, inode->i_ino, *offset, kernel_buffer, len);
+  
+  mutex_unlock(&vtfs_mutex);
+  kfree(kernel_buffer);
+  
+  if (ret != 0) {
+    return ret;
   }
   
   *offset += len;
-  mutex_unlock(&vtfs_mutex);
-  
   return len;
 }
 
 // Заполнение super_block
 static int vtfs_fill_super(struct super_block *sb, void *data, int silent) {
   struct inode* inode;
-  struct vtfs_dir *root;
+  ino_t root_ino;
+  int ret;
   
-  inode = vtfs_get_inode(sb, NULL, S_IFDIR | S_IRWXUGO, VTFS_ROOT_INODE_NUMBER);
-  if (inode == NULL) {
-    return -ENOMEM;
-  }
-
-  // Инициализировать корневую директорию в RAM
   mutex_lock(&vtfs_mutex);
-  root = vtfs_create_dir(VTFS_ROOT_INODE_NUMBER, VTFS_ROOT_INODE_NUMBER);
-  if (!root) {
+  
+  // Получить корневой inode с сервера
+  ret = vtfs_api_root(vtfs_token, &root_ino);
+  
+  if (ret != 0) {
     mutex_unlock(&vtfs_mutex);
-    iput(inode);
+    LOG("Failed to get root inode from server: %d\n", ret);
+    return ret;
+  }
+  
+  LOG("Got root inode: %lu\n", (unsigned long)root_ino);
+  
+  inode = vtfs_get_inode(sb, NULL, S_IFDIR | S_IRWXUGO, root_ino);
+  if (inode == NULL) {
+    mutex_unlock(&vtfs_mutex);
     return -ENOMEM;
   }
-  mutex_unlock(&vtfs_mutex);
 
   // Устанавливаем операции для корневой директории
   inode->i_op = &vtfs_inode_ops;
@@ -747,9 +459,11 @@ static int vtfs_fill_super(struct super_block *sb, void *data, int silent) {
 
   sb->s_root = d_make_root(inode);
   if (sb->s_root == NULL) {
+    mutex_unlock(&vtfs_mutex);
     return -ENOMEM;
   }
 
+  mutex_unlock(&vtfs_mutex);
   LOG("Super block filled successfully\n");
   return 0;
 }
@@ -759,7 +473,21 @@ static struct dentry* vtfs_mount(struct file_system_type* fs_type,
                                   int flags,
                                   const char* token,
                                   void* data) {
-  struct dentry* ret = mount_nodev(fs_type, flags, data, vtfs_fill_super);
+  struct dentry* ret;
+  
+  // Сохранить токен
+  mutex_lock(&vtfs_mutex);
+  if (token) {
+    strncpy(vtfs_token, token, VTFS_MAX_TOKEN_LEN - 1);
+    vtfs_token[VTFS_MAX_TOKEN_LEN - 1] = '\0';
+    LOG("Token saved: %s\n", vtfs_token);
+  } else {
+    vtfs_token[0] = '\0';
+    LOG("No token provided\n");
+  }
+  mutex_unlock(&vtfs_mutex);
+  
+  ret = mount_nodev(fs_type, flags, data, vtfs_fill_super);
   if (ret == NULL) {
     printk(KERN_ERR "[vtfs] Can't mount file system\n");
   } else {
@@ -770,37 +498,11 @@ static struct dentry* vtfs_mount(struct file_system_type* fs_type,
 
 // Отмонтирование файловой системы
 static void vtfs_kill_sb(struct super_block* sb) {
-  struct vtfs_dir *dir, *dir_tmp;
-  struct vtfs_dir_entry *entry, *entry_tmp;
-  struct vtfs_file_data *file_data, *file_tmp;
-  
   LOG("vtfs super block is destroyed. Unmount successfully.\n");
   
-  // Очистить все директории и их содержимое
+  // Очистить токен
   mutex_lock(&vtfs_mutex);
-  
-  // Очистить все файлы
-  list_for_each_entry_safe(file_data, file_tmp, &all_files, list) {
-    if (file_data->data) {
-      kfree(file_data->data);
-    }
-    list_del(&file_data->list);
-    kfree(file_data);
-  }
-  
-  // Очистить все директории
-  list_for_each_entry_safe(dir, dir_tmp, &all_directories, list) {
-    // Удалить все записи в директории
-    list_for_each_entry_safe(entry, entry_tmp, &dir->entries, list) {
-      list_del(&entry->list);
-      kfree(entry);
-    }
-    // Удалить саму директорию
-    list_del(&dir->list);
-    kfree(dir);
-  }
-  
-  next_ino = VTFS_ROOT_INODE_NUMBER + 1;
+  vtfs_token[0] = '\0';
   mutex_unlock(&vtfs_mutex);
   
   kill_anon_super(sb);
