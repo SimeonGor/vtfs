@@ -204,7 +204,8 @@ static int vtfs_iterate(struct file* filp, struct dir_context* ctx) {
       ctx->pos++;
     }
   }
-  
+
+out_ok:
   mutex_unlock(&vtfs_mutex);
   kfree(entries);
   return 0;
