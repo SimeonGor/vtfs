@@ -66,18 +66,23 @@ static int receive_all(struct socket *sock, char *buffer, size_t buffer_size) {
 }
 
 static int64_t parse_http_response(char *raw_response, size_t raw_response_size,
-                            char *response, size_t response_size) {
+                                   char *response, size_t response_size) {
   char *buffer = raw_response;
 
-  // Read Response Line
+  // --- Response line ---
   {
     char *status_line = strsep(&buffer, "\r");
-    strsep(&status_line, " ");
-    if (status_line == 0) {
+    (void)strsep(&status_line, " "); // "HTTP/1.1"
+    if (status_line == NULL) {
       return -6;
     }
     char *status_code = strsep(&status_line, " ");
+    if (status_code == NULL) {
+      return -6;
+    }
+
     printk(KERN_INFO "Received response with status code %s\n", status_code);
+
     if (strcmp(status_code, "200") != 0) {
       return -5;
     }
@@ -85,14 +90,27 @@ static int64_t parse_http_response(char *raw_response, size_t raw_response_size,
 
   int length = -1;
 
+  // --- Headers ---
   while (true) {
-    if (buffer == 0) {
+    if (buffer == NULL) {
       return -6;
     }
+
     char *header = strsep(&buffer, "\r");
-    ++header; // skip \n
+    if (header == NULL) {
+      return -6;
+    }
+
+    // after strsep(...,"\r") buffer points to "\n..." => skip '\n'
+    if (buffer == NULL) {
+      return -6;
+    }
+    if (*buffer == '\n') {
+      buffer++;
+    }
+
     if (strcmp(header, "") == 0) {
-      // end of headers
+      // end of headers (we consumed "\r\n")
       break;
     }
 
@@ -104,34 +122,42 @@ static int64_t parse_http_response(char *raw_response, size_t raw_response_size,
       printk(KERN_INFO "Received response with content length %d\n", length);
     }
   }
-  ++buffer; // skip last '\n'
 
-  if (length == -1) {
+  if (length < 0) {
     return -6;
   }
 
-  if (buffer + length > raw_response + raw_response_size) {
+  // buffer now points to body
+  if ((size_t)(buffer - raw_response) > raw_response_size) {
     return -6;
   }
 
-  if (length < sizeof(int64_t)) {
+  if ((size_t)length > raw_response_size - (size_t)(buffer - raw_response)) {
+    return -6;
+  }
+
+  if (length < (int)sizeof(int64_t)) {
     return -7;
   }
 
-  length -= sizeof(int64_t);
+  // Body format: [int64 ret][payload bytes...]
+  int payload_len = length - (int)sizeof(int64_t);
 
-  if (length > response_size) {
+  // Need +1 to add '\0' for JSON parsing via strstr/...
+  if ((size_t)payload_len + 1 > response_size) {
     return -ENOSPC;
   }
 
   int64_t return_value;
   memcpy(&return_value, buffer, sizeof(int64_t));
-
   buffer += sizeof(int64_t);
-  memcpy(response, buffer, length);
+
+  memcpy(response, buffer, payload_len);
+  response[payload_len] = '\0'; // IMPORTANT
 
   return return_value;
 }
+
 
 int64_t vtfs_http_call(const char *token, const char *method,
                             char *response_buffer, size_t buffer_size,
@@ -284,40 +310,72 @@ int base64_decode(const char *src, char *dst, size_t dst_size) {
 
 // ========== Простой JSON парсер ==========
 
+// ===== helper: parse int from JSON position until non-digit =====
+static int json_parse_int(const char *p, int *out) {
+  long val = 0;
+  int sign = 1;
+  int have_digit = 0;
+
+  if (!p || !out)
+    return -1;
+
+  while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')
+    p++;
+
+  if (*p == '-') {
+    sign = -1;
+    p++;
+  }
+
+  while (*p >= '0' && *p <= '9') {
+    have_digit = 1;
+    val = val * 10 + (*p - '0');
+    p++;
+  }
+
+  if (!have_digit)
+    return -1;
+
+  *out = (int)(val * sign);
+  return 0;
+}
+
 // Извлечь значение поля "code" из JSON
 int json_get_code(const char *json) {
   const char *code_str = strstr(json, "\"code\":");
+  int code;
+
   if (!code_str) {
     return -1;
   }
-  
-  code_str += 7; // Пропустить "code":
-  while (*code_str == ' ') code_str++;
-  
-  int code = 0;
-  if (kstrtoint(code_str, 10, &code) != 0) {
+
+  code_str += 7; // после '"code":'
+  if (json_parse_int(code_str, &code) != 0) {
     return -1;
   }
+
   return code;
 }
 
-// Извлечь числовое значение поля из "data"
+// Извлечь числовое значение поля (например "ino") из JSON
 int json_get_data_int(const char *json, const char *field) {
   char search[256];
+  const char *field_str;
+  int value;
+
   snprintf(search, sizeof(search), "\"%s\":", field);
-  
-  const char *field_str = strstr(json, search);
+
+  field_str = strstr(json, search);
   if (!field_str) {
     return -1;
   }
-  
+
   field_str += strlen(search);
-  while (*field_str == ' ') field_str++;
-  
-  int value = 0;
-  if (kstrtoint(field_str, 10, &value) != 0) {
+
+  if (json_parse_int(field_str, &value) != 0) {
     return -1;
   }
+
   return value;
 }
 
