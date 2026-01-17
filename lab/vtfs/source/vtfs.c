@@ -166,21 +166,28 @@ static int vtfs_iterate(struct file* filp, struct dir_context* ctx) {
   
   // Всегда показываем . и ..
   if (ctx->pos == 0) {
-    dir_emit(ctx, ".", 1, ino, DT_DIR);
-    ctx->pos++;
+    if (!dir_emit(ctx, ".", 1, ino, DT_DIR))
+      goto out_ok;
+    ctx->pos = 1;
   }
-  
+
   if (ctx->pos == 1) {
-    ino_t parent_ino = ino; // Для корня parent = сам корень
-    if (dentry->d_parent && dentry->d_parent->d_inode) {
-      parent_ino = dentry->d_parent->d_inode->i_ino;
-    }
-    dir_emit(ctx, "..", 2, parent_ino, DT_DIR);
-    ctx->pos++;
+    ino_t parent_ino = ino;
+    if (dentry->d_parent && d_inode(dentry->d_parent))
+      parent_ino = d_inode(dentry->d_parent)->i_ino;
+
+    if (!dir_emit(ctx, "..", 2, parent_ino, DT_DIR))
+      goto out_ok;
+    ctx->pos = 2;
   }
   
   // Получить список файлов с сервера
   ret = vtfs_api_list(vtfs_token, ino, entries, 256, &count);
+  if (ret != 0) {
+    mutex_unlock(&vtfs_mutex);
+    kfree(entries);
+    return ret;
+  }
   
   if (ret == 0) {
     // Показать файлы начиная с текущей позиции
