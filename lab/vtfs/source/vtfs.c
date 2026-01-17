@@ -7,6 +7,7 @@
 #include <linux/string.h>
 #include <linux/slab.h>
 #include <linux/list.h>
+#include <linux/uaccess.h>
 
 #define MODULE_NAME "vtfs"
 
@@ -18,6 +19,15 @@ MODULE_DESCRIPTION("A simple FS kernel module");
 
 #define VTFS_ROOT_INODE_NUMBER 1000
 #define VTFS_MAX_FILENAME 255
+
+// Структура для хранения содержимого файла
+struct vtfs_file_data {
+  struct list_head list;  // Для глобального списка файлов
+  ino_t ino;
+  char *data;             // Содержимое файла
+  size_t size;            // Размер данных
+  size_t capacity;        // Выделенная память
+};
 
 // Структура для представления записи в директории
 struct vtfs_dir_entry {
@@ -37,6 +47,7 @@ struct vtfs_dir {
 
 // Глобальные переменные для хранилища
 static LIST_HEAD(all_directories);  // Глобальный список всех директорий
+static LIST_HEAD(all_files);        // Глобальный список всех файлов
 static ino_t next_ino = VTFS_ROOT_INODE_NUMBER + 1;
 static DEFINE_MUTEX(vtfs_mutex);
 
@@ -71,6 +82,10 @@ static int vtfs_mkdir(struct mnt_idmap *idmap,
                        umode_t mode);
 static int vtfs_rmdir(struct inode *parent_inode,
                        struct dentry *child_dentry);
+static ssize_t vtfs_read(struct file *filp, char __user *buffer,
+                          size_t len, loff_t *offset);
+static ssize_t vtfs_write(struct file *filp, const char __user *buffer,
+                           size_t len, loff_t *offset);
 
 // Структуры операций для inode и файлов
 static struct inode_operations vtfs_inode_ops = {
@@ -85,12 +100,68 @@ static struct file_operations vtfs_dir_ops = {
   .iterate_shared = vtfs_iterate,
 };
 
+static struct file_operations vtfs_file_ops = {
+  .read = vtfs_read,
+  .write = vtfs_write,
+};
+
 // Структура описания файловой системы
 static struct file_system_type vtfs_fs_type = {
   .name = "vtfs",
   .mount = vtfs_mount,
   .kill_sb = vtfs_kill_sb,
 };
+
+// ========== Функции для работы с содержимым файлов ==========
+
+// Найти данные файла по inode
+static struct vtfs_file_data* vtfs_find_file_data(ino_t ino) {
+  struct vtfs_file_data *file_data;
+  
+  list_for_each_entry(file_data, &all_files, list) {
+    if (file_data->ino == ino) {
+      return file_data;
+    }
+  }
+  return NULL;
+}
+
+// Создать пустой файл
+static struct vtfs_file_data* vtfs_create_file_data(ino_t ino) {
+  struct vtfs_file_data *file_data;
+  
+  file_data = kmalloc(sizeof(*file_data), GFP_KERNEL);
+  if (!file_data) {
+    return NULL;
+  }
+  
+  file_data->ino = ino;
+  file_data->data = NULL;
+  file_data->size = 0;
+  file_data->capacity = 0;
+  
+  list_add_tail(&file_data->list, &all_files);
+  return file_data;
+}
+
+// Удалить данные файла
+static void vtfs_remove_file_data(ino_t ino) {
+  struct vtfs_file_data *file_data;
+  
+  file_data = vtfs_find_file_data(ino);
+  if (!file_data) {
+    return;
+  }
+  
+  if (file_data->data) {
+    kfree(file_data->data);
+  }
+  
+  list_del(&file_data->list);
+  kfree(file_data);
+}
+
+// ========== Функции для работы с RAM-хранилищем директорий ==========
 
 // Найти директорию по inode
 static struct vtfs_dir* vtfs_find_dir(ino_t ino) {
@@ -239,7 +310,7 @@ static struct dentry* vtfs_lookup(struct inode* parent_inode,
       if (S_ISDIR(entry->mode)) {
         inode->i_fop = &vtfs_dir_ops;
       } else {
-        inode->i_fop = NULL;
+        inode->i_fop = &vtfs_file_ops;
       }
       d_add(child_dentry, inode);
     }
@@ -302,6 +373,7 @@ static int vtfs_create(struct mnt_idmap *idmap,
   const char *name = child_dentry->d_name.name;
   struct vtfs_dir *dir;
   struct inode *inode;
+  struct vtfs_file_data *file_data;
   ino_t new_ino;
   int ret;
   
@@ -314,8 +386,17 @@ static int vtfs_create(struct mnt_idmap *idmap,
   }
   
   new_ino = next_ino++;
+  
+  // Создать данные файла
+  file_data = vtfs_create_file_data(new_ino);
+  if (!file_data) {
+    mutex_unlock(&vtfs_mutex);
+    return -ENOMEM;
+  }
+  
   ret = vtfs_add_entry(dir, name, new_ino, S_IFREG | S_IRWXUGO);
   if (ret) {
+    vtfs_remove_file_data(new_ino);
     mutex_unlock(&vtfs_mutex);
     return ret;
   }
@@ -323,12 +404,13 @@ static int vtfs_create(struct mnt_idmap *idmap,
   inode = vtfs_get_inode(parent_inode->i_sb, NULL, S_IFREG | S_IRWXUGO, new_ino);
   if (!inode) {
     vtfs_remove_entry(dir, name);
+    vtfs_remove_file_data(new_ino);
     mutex_unlock(&vtfs_mutex);
     return -ENOMEM;
   }
   
   inode->i_op = &vtfs_inode_ops;
-  inode->i_fop = NULL;
+  inode->i_fop = &vtfs_file_ops;
   d_add(child_dentry, inode);
   
   mutex_unlock(&vtfs_mutex);
@@ -341,6 +423,7 @@ static int vtfs_unlink(struct inode *parent_inode,
   ino_t parent_ino = parent_inode->i_ino;
   const char *name = child_dentry->d_name.name;
   struct vtfs_dir *dir;
+  struct vtfs_dir_entry *entry;
   int ret;
   
   mutex_lock(&vtfs_mutex);
@@ -350,6 +433,15 @@ static int vtfs_unlink(struct inode *parent_inode,
     mutex_unlock(&vtfs_mutex);
     return -ENOENT;
   }
+  
+  entry = vtfs_find_entry(dir, name);
+  if (!entry) {
+    mutex_unlock(&vtfs_mutex);
+    return -ENOENT;
+  }
+  
+  // Удалить данные файла
+  vtfs_remove_file_data(entry->ino);
   
   ret = vtfs_remove_entry(dir, name);
   
@@ -459,11 +551,107 @@ static int vtfs_rmdir(struct inode *parent_inode,
   return 0;
 }
 
+// Функция read - чтение из файла
+static ssize_t vtfs_read(struct file *filp, char __user *buffer,
+                          size_t len, loff_t *offset) {
+  struct inode *inode = file_inode(filp);
+  struct vtfs_file_data *file_data;
+  size_t to_read;
+  
+  mutex_lock(&vtfs_mutex);
+  
+  file_data = vtfs_find_file_data(inode->i_ino);
+  if (!file_data) {
+    mutex_unlock(&vtfs_mutex);
+    return -ENOENT;
+  }
+  
+  // Проверить границы чтения
+  if (*offset >= file_data->size) {
+    mutex_unlock(&vtfs_mutex);
+    return 0;  // EOF
+  }
+  
+  // Вычислить сколько байт читать
+  to_read = min(len, file_data->size - (size_t)*offset);
+  
+  // Скопировать данные в user-space
+  if (copy_to_user(buffer, file_data->data + *offset, to_read)) {
+    mutex_unlock(&vtfs_mutex);
+    return -EFAULT;
+  }
+  
+  *offset += to_read;
+  mutex_unlock(&vtfs_mutex);
+  
+  return to_read;
+}
+
+// Функция write - запись в файл
+static ssize_t vtfs_write(struct file *filp, const char __user *buffer,
+                           size_t len, loff_t *offset) {
+  struct inode *inode = file_inode(filp);
+  struct vtfs_file_data *file_data;
+  size_t new_size;
+  char *new_data;
+  
+  mutex_lock(&vtfs_mutex);
+  
+  file_data = vtfs_find_file_data(inode->i_ino);
+  if (!file_data) {
+    mutex_unlock(&vtfs_mutex);
+    return -ENOENT;
+  }
+  
+  // Вычислить новый размер файла
+  new_size = *offset + len;
+  
+  // Если нужно больше памяти, перевыделить
+  if (new_size > file_data->capacity) {
+    size_t new_capacity = max(new_size, file_data->capacity * 2);
+    if (new_capacity == 0) {
+      new_capacity = PAGE_SIZE;
+    }
+    
+    new_data = krealloc(file_data->data, new_capacity, GFP_KERNEL);
+    if (!new_data) {
+      mutex_unlock(&vtfs_mutex);
+      return -ENOMEM;
+    }
+    
+    file_data->data = new_data;
+    file_data->capacity = new_capacity;
+  }
+  
+  // Если записываем за пределами текущего размера, заполнить нулями
+  if (*offset > file_data->size) {
+    memset(file_data->data + file_data->size, 0, *offset - file_data->size);
+  }
+  
+  // Скопировать данные из user-space
+  if (copy_from_user(file_data->data + *offset, buffer, len)) {
+    mutex_unlock(&vtfs_mutex);
+    return -EFAULT;
+  }
+  
+  // Обновить размер файла
+  if (new_size > file_data->size) {
+    file_data->size = new_size;
+    inode->i_size = new_size;
+  }
+  
+  *offset += len;
+  mutex_unlock(&vtfs_mutex);
+  
+  return len;
+}
+
 // Заполнение super_block
 static int vtfs_fill_super(struct super_block *sb, void *data, int silent) {
+  struct inode* inode;
   struct vtfs_dir *root;
-  struct inode* inode = vtfs_get_inode(sb, NULL, S_IFDIR | S_IRWXUGO, VTFS_ROOT_INODE_NUMBER);
   
+  inode = vtfs_get_inode(sb, NULL, S_IFDIR | S_IRWXUGO, VTFS_ROOT_INODE_NUMBER);
   if (inode == NULL) {
     return -ENOMEM;
   }
@@ -509,11 +697,23 @@ static struct dentry* vtfs_mount(struct file_system_type* fs_type,
 static void vtfs_kill_sb(struct super_block* sb) {
   struct vtfs_dir *dir, *dir_tmp;
   struct vtfs_dir_entry *entry, *entry_tmp;
+  struct vtfs_file_data *file_data, *file_tmp;
   
   LOG("vtfs super block is destroyed. Unmount successfully.\n");
   
   // Очистить все директории и их содержимое
   mutex_lock(&vtfs_mutex);
+  
+  // Очистить все файлы
+  list_for_each_entry_safe(file_data, file_tmp, &all_files, list) {
+    if (file_data->data) {
+      kfree(file_data->data);
+    }
+    list_del(&file_data->list);
+    kfree(file_data);
+  }
+  
+  // Очистить все директории
   list_for_each_entry_safe(dir, dir_tmp, &all_directories, list) {
     // Удалить все записи в директории
     list_for_each_entry_safe(entry, entry_tmp, &dir->entries, list) {
